@@ -539,7 +539,211 @@ function LeadFinder(){
   </div>);
 }
 
-// ── STRATEGY ──────────────────────────────────────────────
+// ── LEAD FINDER ───────────────────────────────────────────
+function LeadFinder(){
+  const [niche,setNiche]=useState('');
+  const [city,setCity]=useState('');
+  const [country,setCountry]=useState('India');
+  const [leads,setLeads]=useState([]);
+  const [loading,setLoading]=useState(false);
+  const [progress,setProgress]=useState('');
+  const [sel,setSel]=useState([]);
+  const [importing,setImporting]=useState(false);
+  const NICHES=['dental clinic','hotel','travel agency','gym','restaurant','lawyer','real estate','hospital','salon','spa','pharmacy','architect','ca firm','interior designer','school','coaching center'];
+
+  async function search(){
+    if(!niche||!city){toast.err('Enter niche and city');return;}
+    setLoading(true);setLeads([]);setSel([]);
+    setProgress('🤖 AI is finding businesses...');
+    try{
+      // Step 1: Use Gemini AI to find businesses
+      const prompt=`Find 20 real businesses for niche "${niche}" in "${city}", ${country}.
+
+For each business provide:
+- name: business name
+- phone: phone number (with country code if possible)
+- website: website URL (if exists)
+- email: email address (if publicly known)
+- address: full address
+
+Return ONLY a valid JSON array. No explanation, no markdown, no code blocks. Just the raw JSON array.
+Example format:
+[{"name":"ABC Dental","phone":"+91 9876543210","website":"abcdental.com","email":"info@abcdental.com","address":"123 Main St, ${city}"}]
+
+If email is not known, use empty string "". Include as many real details as possible.`;
+
+      const res=await fetch(`${GEMINI_URL}`,{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({
+          contents:[{parts:[{text:prompt}]}],
+          generationConfig:{temperature:0.2,maxOutputTokens:4000}
+        })
+      });
+      const data=await res.json();
+      let text=data?.candidates?.[0]?.content?.parts?.[0]?.text||'[]';
+
+      // Clean up response - remove markdown if present
+      text=text.replace(/```json/g,'').replace(/```/g,'').trim();
+
+      // Find JSON array in response
+      const start=text.indexOf('[');
+      const end=text.lastIndexOf(']');
+      if(start===-1||end===-1){toast.err('No results found. Try different niche or city.');setLoading(false);setProgress('');return;}
+      text=text.slice(start,end+1);
+
+      let parsed=[];
+      try{parsed=JSON.parse(text);}
+      catch{toast.err('Could not parse results. Try again.');setLoading(false);setProgress('');return;}
+
+      if(!parsed.length){toast.err('No businesses found. Try different niche or city.');setLoading(false);setProgress('');return;}
+
+      // Step 2: Try to get emails from websites for leads without email
+      const results=parsed.map((b,i)=>({
+        id:i+1,
+        name:b.name||b.business_name||'',
+        phone:b.phone||b.phone_number||b.contact||'',
+        website:b.website||b.url||b.website_url||'',
+        email:b.email||b.email_address||'',
+        address:b.address||b.location||city,
+      })).filter(b=>b.name);
+
+      // Try to extract emails from websites
+      let checked=0;
+      for(let i=0;i<results.length;i++){
+        const lead=results[i];
+        if(lead.website&&!lead.email){
+          checked++;
+          setProgress(`📧 Checking website ${checked}: ${lead.name}`);
+          try{
+            const url=lead.website.startsWith('http')?lead.website:'https://'+lead.website;
+            const proxies=[
+              `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+              `https://corsproxy.io/?${encodeURIComponent(url)}`,
+            ];
+            for(const proxy of proxies){
+              try{
+                const r=await fetch(proxy,{signal:AbortSignal.timeout(5000)});
+                if(r.ok){
+                  const html=await r.text();
+                  const emails=(html.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g)||[])
+                    .filter(e=>!e.includes('example')&&!e.includes('sentry')&&!e.includes('wix')&&!e.includes('schema')&&!e.includes('png')&&!e.includes('jpg')&&!e.includes('@2x')&&e.length<60);
+                  if(emails.length){lead.email=emails[0];break;}
+                }
+              }catch{}
+            }
+          }catch{}
+        }
+      }
+
+      setLeads(results);
+      const wEmail=results.filter(r=>r.email).length;
+      const wPhone=results.filter(r=>r.phone).length;
+      toast.ok(`Found ${results.length} businesses · ${wEmail} emails · ${wPhone} phones ✓`);
+    }catch(err){
+      toast.err('Search failed: '+err.message);
+    }
+    setLoading(false);setProgress('');
+  }
+
+  async function importContacts(){
+    const toImp=leads.filter(l=>sel.includes(l.id)&&l.email);
+    if(!toImp.length){toast.err('Select leads with emails to import');return;}
+    setImporting(true);
+    const{error}=await sb.from('contacts').upsert(
+      toImp.map(l=>({name:l.name,email:l.email,website:l.website||'',phone:l.phone||''})),
+      {onConflict:'email'}
+    );
+    if(error)toast.err('Import failed: '+error.message);
+    else toast.ok(`Imported ${toImp.length} contacts to Contacts ✓`);
+    setImporting(false);
+  }
+
+  function exportX(){
+    const ws=XLSX.utils.json_to_sheet(leads.map(l=>({Name:l.name,Email:l.email||'',Phone:l.phone||'',Website:l.website||'',Address:l.address||''})));
+    const wb=XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb,ws,'Leads');
+    XLSX.writeFile(wb,`leads_${niche}_${city}.xlsx`);
+    toast.ok('Exported to Excel ✓');
+  }
+
+  const togAll=()=>setSel(sel.length===leads.length?[]:leads.map(l=>l.id));
+  const togOne=id=>setSel(s=>s.includes(id)?s.filter(x=>x!==id):[...s,id]);
+
+  return(<div className="page">
+    <div className="ph">
+      <h1 className="pt">🔍 Lead Finder</h1>
+      <p className="ps">AI-powered business finder — name, phone, website & email automatically</p>
+    </div>
+
+    <div className="card" style={{marginBottom:22}}>
+      <div className="ct">🎯 Find Businesses with AI</div>
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:14,marginBottom:14}}>
+        <div className="fg" style={{marginBottom:0}}>
+          <label className="fl">Niche / Business Type</label>
+          <input placeholder="e.g. dental clinic, hotel, gym" value={niche} onChange={e=>setNiche(e.target.value)} onKeyDown={e=>e.key==='Enter'&&search()}/>
+        </div>
+        <div className="fg" style={{marginBottom:0}}>
+          <label className="fl">City</label>
+          <input placeholder="e.g. Rajkot, Mumbai, Delhi" value={city} onChange={e=>setCity(e.target.value)} onKeyDown={e=>e.key==='Enter'&&search()}/>
+        </div>
+        <div className="fg" style={{marginBottom:0}}>
+          <label className="fl">Country</label>
+          <input placeholder="India" value={country} onChange={e=>setCountry(e.target.value)}/>
+        </div>
+      </div>
+      <div style={{display:'flex',gap:5,flexWrap:'wrap',marginBottom:14}}>
+        {NICHES.map(n=><button key={n} onClick={()=>setNiche(n)} className="btn bs bsm" style={{fontSize:11,borderColor:niche===n?'var(--accent)':'var(--border)',color:niche===n?'var(--accent2)':'var(--text3)'}}>{n}</button>)}
+      </div>
+      <button className="btn bp" onClick={search} disabled={loading||!niche||!city}>
+        {loading?<><span className="spin"/>Searching...</>:<>🤖 Find Leads with AI</>}
+      </button>
+      {progress&&<div style={{marginTop:10,fontSize:13,color:'var(--accent2)',display:'flex',alignItems:'center',gap:7}}><span className="spin"/>{progress}</div>}
+      <div style={{marginTop:12,padding:'10px 14px',background:'var(--aglow)',border:'1px solid #6c63ff20',borderRadius:'var(--r)',fontSize:12,color:'var(--accent2)'}}>
+        🤖 Powered by Gemini AI — finds real businesses with contact details instantly
+      </div>
+    </div>
+
+    {leads.length>0&&<>
+      <div className="sg" style={{marginBottom:18}}>
+        <div className="sc"><span className="sl">Found</span><span className="sv">{leads.length}</span></div>
+        <div className="sc"><span className="sl">With Email</span><span className="sv" style={{color:'var(--ok)'}}>{leads.filter(l=>l.email).length}</span></div>
+        <div className="sc"><span className="sl">With Phone</span><span className="sv" style={{color:'var(--accent2)'}}>{leads.filter(l=>l.phone).length}</span></div>
+        <div className="sc"><span className="sl">With Website</span><span className="sv" style={{color:'var(--warn)'}}>{leads.filter(l=>l.website).length}</span></div>
+      </div>
+      <div style={{display:'flex',gap:8,marginBottom:14,flexWrap:'wrap',alignItems:'center'}}>
+        <button className="btn bg" onClick={importContacts} disabled={importing||!sel.length}>
+          {importing?<><span className="spin"/>Importing...</>:<>⬆️ Import {sel.filter(id=>leads.find(l=>l.id===id)?.email).length} to Contacts</>}
+        </button>
+        <button className="btn bs" onClick={exportX}>⬇️ Export Excel</button>
+        <span style={{fontSize:12,color:'var(--text3)'}}>{sel.length} selected</span>
+      </div>
+      <div className="tw"><table>
+        <thead><tr>
+          <th><input type="checkbox" checked={sel.length===leads.length&&leads.length>0} onChange={togAll} style={{width:'auto',cursor:'pointer'}}/></th>
+          <th>Business Name</th><th>Email</th><th>Phone</th><th>Website</th><th>Address</th>
+        </tr></thead>
+        <tbody>{leads.map(l=><tr key={l.id}>
+          <td><input type="checkbox" checked={sel.includes(l.id)} onChange={()=>togOne(l.id)} style={{width:'auto',cursor:'pointer'}}/></td>
+          <td style={{fontWeight:500}}>{l.name}</td>
+          <td>{l.email?<span style={{color:'var(--ok)',fontSize:12}}>{l.email}</span>:<span style={{color:'var(--text3)',fontSize:11}}>—</span>}</td>
+          <td style={{fontSize:12,color:'var(--text2)'}}>{l.phone||'—'}</td>
+          <td>{l.website?<a href={l.website.startsWith('http')?l.website:'https://'+l.website} target="_blank" rel="noreferrer" style={{color:'var(--accent2)',fontSize:12,textDecoration:'none'}}>🌐 Visit</a>:<span style={{color:'var(--text3)',fontSize:11}}>—</span>}</td>
+          <td style={{fontSize:11,color:'var(--text3)',maxWidth:180}}>{l.address||'—'}</td>
+        </tr>)}</tbody>
+      </table></div>
+      <div style={{marginTop:12,padding:'10px 14px',background:'var(--aglow)',border:'1px solid #6c63ff20',borderRadius:'var(--r)',fontSize:12,color:'var(--accent2)'}}>
+        💡 Select leads → Import to Contacts → Go to Campaigns → Send cold emails!
+      </div>
+    </>}
+
+    {!loading&&leads.length===0&&<div className="es">
+      <div style={{fontSize:48}}>🔍</div>
+      <h3>Find your next clients</h3>
+      <p>Enter niche and city — AI will find real businesses with contact details</p>
+    </div>}
+  </div>);
+}
 function Strategy(){
   const [tab,setTab]=useState('niches');const [expN,setExpN]=useState(null);
   function copy(text){navigator.clipboard.writeText(text);toast.ok('Copied ✓');}
